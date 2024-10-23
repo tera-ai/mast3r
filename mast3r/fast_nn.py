@@ -129,9 +129,8 @@ def fast_reciprocal_NNs(pts1, pts2, subsample_or_initxy1=8, ret_xy=True, pixel_t
 
     xy1 = np.int32(np.unique(x1 + W1 * y1))  # make sure there's no doublons
     xy2 = np.full_like(xy1, -1)
-    old_xy1 = xy1.copy()
-    old_xy2 = xy2.copy()
 
+    # Determine whether to use GPU or CPU based on input parameters
     if 'dist' in matcher_kw or 'block_size' in matcher_kw \
             or (isinstance(device, str) and device.startswith('cuda')) \
             or (isinstance(device, torch.device) and device.type.startswith('cuda')):
@@ -139,52 +138,71 @@ def fast_reciprocal_NNs(pts1, pts2, subsample_or_initxy1=8, ret_xy=True, pixel_t
         pts2 = pts2.to(device)
         tree1 = cdistMatcher(pts1, device=device)
         tree2 = cdistMatcher(pts2, device=device)
+        use_gpu = True
     else:
         pts1, pts2 = to_numpy((pts1, pts2))
         tree1 = KDTree(pts1)
         tree2 = KDTree(pts2)
+        use_gpu = False
 
-    notyet = np.ones(len(xy1), dtype=bool)
-    basin = np.full((H1 * W1 + 1,), -1, dtype=np.int32) if ret_basin else None
+    if use_gpu:
+        xy1_gpu = torch.from_numpy(xy1).to(device)
+        xy2_gpu = torch.from_numpy(xy2).to(device)
+        notyet_gpu = torch.ones(len(xy1), dtype=torch.bool, device=device)
+        basin_gpu = torch.full((H1 * W1 + 1,), -1, dtype=torch.int32, device=device) if ret_basin else None
+        old_xy1_gpu = xy1_gpu.clone()
+        old_xy2_gpu = xy2_gpu.clone()
+    else:
+        notyet = np.ones(len(xy1), dtype=bool)
+        basin = np.full((H1 * W1 + 1,), -1, dtype=np.int32) if ret_basin else None
+        old_xy1 = xy1.copy()
+        old_xy2 = xy2.copy()
 
     niter = 0
-    # n_notyet = [len(notyet)]
-    while notyet.any():
-        _, xy2[notyet] = to_numpy(tree2.query(pts1[xy1[notyet]], **matcher_kw))
-        if not ret_basin:
-            notyet &= (old_xy2 != xy2)  # remove points that have converged
+    while (notyet_gpu.any() if use_gpu else notyet.any()):
+        if use_gpu:
+            _, xy2_gpu[notyet_gpu] = tree2.query(pts1[xy1_gpu[notyet_gpu]], **matcher_kw)
+            if not ret_basin:
+                notyet_gpu &= (old_xy2_gpu != xy2_gpu)
+            _, xy1_gpu[notyet_gpu] = tree1.query(pts2[xy2_gpu[notyet_gpu]], **matcher_kw)
+            if ret_basin:
+                basin_gpu[old_xy1_gpu[notyet_gpu]] = xy1_gpu[notyet_gpu]
+            notyet_gpu &= (old_xy1_gpu != xy1_gpu)
+            old_xy2_gpu.copy_(xy2_gpu)
+            old_xy1_gpu.copy_(xy1_gpu)
+        else:
+            _, xy2[notyet] = tree2.query(pts1[xy1[notyet]], **matcher_kw)
+            if not ret_basin:
+                notyet &= (old_xy2 != xy2)
+            _, xy1[notyet] = tree1.query(pts2[xy2[notyet]], **matcher_kw)
+            if ret_basin:
+                basin[old_xy1[notyet]] = xy1[notyet]
+            notyet &= (old_xy1 != xy1)
+            old_xy2[:] = xy2
+            old_xy1[:] = xy1
 
-        _, xy1[notyet] = to_numpy(tree1.query(pts2[xy2[notyet]], **matcher_kw))
-        if ret_basin:
-            basin[old_xy1[notyet]] = xy1[notyet]
-        notyet &= (old_xy1 != xy1)  # remove points that have converged
-
-        # n_notyet.append(notyet.sum())
         niter += 1
         if niter >= max_iter:
             break
 
-        old_xy2[:] = xy2
-        old_xy1[:] = xy1
-
-    # print('notyet_stats:', ' '.join(map(str, (n_notyet+[0]*10)[:max_iter])))
+    if use_gpu:
+        xy1 = xy1_gpu.cpu().numpy()
+        xy2 = xy2_gpu.cpu().numpy()
 
     if pixel_tol > 0:
-        # in case we only want to match some specific points
-        # and still have some way of checking reciprocity
-        old_yx1 = np.unravel_index(old_xy1, (H1, W1))[0].base
+        old_yx1 = np.unravel_index(old_xy1 if not use_gpu else old_xy1_gpu.cpu().numpy(), (H1, W1))[0].base
         new_yx1 = np.unravel_index(xy1, (H1, W1))[0].base
         dis = np.linalg.norm(old_yx1 - new_yx1, axis=-1)
         converged = dis < pixel_tol
         if not isinstance(subsample_or_initxy1, int):
-            xy1 = old_xy1  # replace new points by old ones
+            xy1 = old_xy1 if not use_gpu else old_xy1_gpu.cpu().numpy()  # replace new points by old ones
     else:
-        converged = ~notyet  # converged correspondences
+        converged = ~(notyet if not use_gpu else notyet_gpu.cpu().numpy())  # converged correspondences
 
     # keep only unique correspondences, and sort on xy1
     xy1, xy2 = merge_corres(xy1[converged], xy2[converged], (H1, W1), (H2, W2), ret_xy=ret_xy)
     if ret_basin:
-        return xy1, xy2, basin
+        return xy1, xy2, basin if not use_gpu else basin_gpu.cpu().numpy()
     return xy1, xy2
 
 
@@ -221,3 +239,4 @@ def extract_correspondences_nonsym(A, B, confA, confB, subsample=8, device=None,
     conf = np.minimum(c1[idx], c2[idx])
     corres = (xy1.copy(), xy2.copy(), conf)
     return todevice(corres, device)
+
